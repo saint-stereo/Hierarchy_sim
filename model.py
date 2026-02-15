@@ -45,7 +45,7 @@ class HierarchyModel(mesa.Model):
         granary_capacity: Max storable food per patch.
         gatekeeper_bias: Target insider fraction the gatekeeper protects.
         myth_decay_rate: Per-tick decay applied to myth_counter.
-        stress_threshold: stress_ratio below which pooling is triggered.
+        stress_threshold: fraction of agents underfed that triggers pooling.
         daily_need: Agent maintenance kcal per day.
         carry_capacity: Max kcal an agent can harvest per tick.
         seed: Random seed.
@@ -62,7 +62,7 @@ class HierarchyModel(mesa.Model):
         granary_capacity=50.0,
         gatekeeper_bias=0.6,
         myth_decay_rate=0.02,
-        stress_threshold=1.0,
+        stress_threshold=0.3,
         daily_need=10.0,
         carry_capacity=15.0,
         seed=None,
@@ -103,7 +103,7 @@ class HierarchyModel(mesa.Model):
         for _ in range(n_agents):
             a = ForagerAgent(
                 self,
-                energy=100.0,
+                energy=50.0,
                 carry_capacity=carry_capacity,
                 daily_need=daily_need,
             )
@@ -164,10 +164,11 @@ class HierarchyModel(mesa.Model):
 
     @staticmethod
     def _mean_myth(model):
+        """Mean myth_counter normalised to [0, 1] (cap = 20)."""
         agents = model._living_agents()
         if not agents:
             return 0.0
-        return np.mean([a.myth_counter for a in agents])
+        return np.mean([a.myth_counter for a in agents]) / 20.0
 
     # ------------------------------------------------------------------ step
     def step(self):
@@ -189,12 +190,12 @@ class HierarchyModel(mesa.Model):
         for a in agents:
             harvests[a.unique_id] = a.forage()
 
-        # 2. Pool decision — global stress_ratio vs threshold
+        # 2. Pool decision — per-agent hungry fraction vs threshold
         total_harvest = sum(harvests.values())
-        total_need = sum(a.daily_need for a in agents)
-        stress_ratio = total_harvest / total_need if total_need > 0 else 1.0
+        hungry = sum(1 for a in agents if harvests[a.unique_id] < a.daily_need)
+        hungry_frac = hungry / len(agents) if agents else 0.0
 
-        if stress_ratio < self.stress_threshold:
+        if hungry_frac > self.stress_threshold:
             # --- POOLING MODE ---
             new_gk = self._elect_gatekeeper(agents)
             # Founding exclusion: gatekeeper splits existing agents ONCE
@@ -242,16 +243,19 @@ class HierarchyModel(mesa.Model):
                 if not a.insider and a.myth_counter <= 0:
                     a.insider = True
 
-        # Energy cap: surplus above 300 goes to local granary (both modes)
+        # Energy cap: surplus above 5× daily_need goes to local granary;
+        # anything the granary can't hold stays with the agent up to the cap.
+        energy_cap = self.daily_need * 5
         for a in agents:
-            surplus = max(0.0, a.energy - 300.0)
+            surplus = max(0.0, a.energy - energy_cap)
             if surplus > 0:
                 patch = self.patch_at(a.pos)
                 if patch:
                     overflow = patch.deposit(surplus)
-                    a.energy -= surplus - overflow
+                    # keep what didn't fit, but respect the soft-cap
+                    a.energy = min(a.energy - surplus + overflow, energy_cap)
                 else:
-                    a.energy = 300.0
+                    a.energy = energy_cap
 
         # 3. Narrative reinforcement
         self._narrative_reinforcement(agents)
@@ -314,7 +318,10 @@ class HierarchyModel(mesa.Model):
         if outsiders_hungry and insiders_fed:
             for a in agents:
                 if a.insider:
-                    a.myth_counter += 1.0 / (1.0 + a.myth_counter * 0.05)
+                    a.myth_counter = min(
+                        a.myth_counter + 1.0 / (1.0 + a.myth_counter * 0.05),
+                        20.0,
+                    )
 
     def _myth_decay(self, agents):
         """Decay myth_counter gradually.  Outsiders lose it faster."""
@@ -375,8 +382,8 @@ class HierarchyModel(mesa.Model):
         if birth_prob < 0.01:
             return
 
-        # Find fertile pairs (energy above threshold)
-        fertile = [a for a in agents if a.energy > a.daily_need * 8]
+        # Find fertile pairs (energy above threshold — scaled to new soft-cap)
+        fertile = [a for a in agents if a.energy > a.daily_need * 2]
         self._rng.shuffle(fertile)
         pairs = list(zip(fertile[::2], fertile[1::2]))
 
@@ -391,7 +398,7 @@ class HierarchyModel(mesa.Model):
 
             child = ForagerAgent(
                 self,
-                energy=40.0,
+                energy=25.0,
                 carry_capacity=self.carry_capacity,
                 daily_need=self.daily_need,
             )
@@ -415,7 +422,7 @@ class HierarchyModel(mesa.Model):
             ) * 0.25
 
             self.grid.place_agent(child, parent_a.pos)
-            parent_a.energy -= 30.0
-            parent_b.energy -= 30.0
+            parent_a.energy -= 10.0
+            parent_b.energy -= 10.0
             births_this_tick += 1
             self._births_this_step += 1
